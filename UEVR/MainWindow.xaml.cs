@@ -114,7 +114,9 @@ namespace UEVR {
             { "VR_RenderingMethod", ((int)RenderingMethod.NativeStereo).ToString() },
             { "VR_SyncedSequentialMethod", ((int)SyncedSequentialMethods.SkipDraw).ToString() },
             { "VR_UncapFramerate", "true" },
-            { "VR_Compatibility_SkipPostInitProperties", "false" }
+            { "VR_Compatibility_SkipPostInitProperties", "false" },
+            { "Frontend_AutoInject", "false" },
+            { "Frontend_AutoInjectDelay", "0" }
         };
     };
 
@@ -129,9 +131,18 @@ namespace UEVR {
         "Skip Tick: Skips the engine tick on the next frame. Usually works well but sometimes causes issues.\n" +
         "Skip Draw: Skips the viewport draw on the next frame. Works with least issues but particle effects can play slower in some cases.\n";
 
+        public static string Frontend_AutoInject =
+        "Inject automatically whenever this game is running and the frontend is open, with the runtime and options selected here.";
+
+        public static string Frontend_AutoInjectDelay =
+        "Requires \"Frontend_AutoInject\".\n" +
+        "Seconds to wait after the game has a window and a D3D device before injecting. Raise it for games that crash when injected too early.";
+
         public static Dictionary<string, string> Entries = new Dictionary<string, string>() {
             { "VR_RenderingMethod", VR_RenderingMethod },
             { "VR_SyncedSequentialMethod", VR_SyncedSequentialMethod },
+            { "Frontend_AutoInject", Frontend_AutoInject },
+            { "Frontend_AutoInjectDelay", Frontend_AutoInjectDelay },
         };
     }
 
@@ -317,53 +328,103 @@ namespace UEVR {
                 }
 
                 if (now - m_lastAutoInjectTime > oneSecond) {
-                    if (m_nullifyVRPluginsCheckbox.IsChecked == true) {
-                        IntPtr nullifierBase;
-                        if (Injector.InjectDll(process.Id, "UEVRPluginNullifier.dll", out nullifierBase) && nullifierBase.ToInt64() > 0) {
-                            if (!Injector.CallFunctionNoArgs(process.Id, "UEVRPluginNullifier.dll", nullifierBase, "nullify", true)) {
-                                //MessageBox.Show("Failed to nullify VR plugins.");
-                            }
-                        } else {
-                            //MessageBox.Show("Failed to inject plugin nullifier.");
-                        }
-                    }
-
-                    string runtimeName;
-
-                    if (m_openvrRadio.IsChecked == true) {
-                        runtimeName = "openvr_api.dll";
-                    } else if (m_openxrRadio.IsChecked == true) {
-                        runtimeName = "openxr_loader.dll";
-                    } else {
-                        runtimeName = "openvr_api.dll";
-                    }
-
-                    if (Injector.InjectDll(process.Id, runtimeName)) {
-                        InitializeConfig(process.ProcessName);
-
-                        try {
-                            if (m_currentConfig != null) {
-                                if (m_currentConfig["Frontend_RequestedRuntime"] != runtimeName) {
-                                    m_currentConfig["Frontend_RequestedRuntime"] = runtimeName;
-                                    RefreshConfigUI();
-                                    SaveCurrentConfig();
-                                }
-                            }
-                        } catch (Exception) {
-
-                        }
-
-                        Injector.InjectDll(process.Id, "UEVRBackend.dll");
-                    }
+                    InjectInto(process, false);
 
                     m_lastAutoInjectTime = now;
                     m_commandLineAttachExe = null; // no need anymore.
                     FillProcessList();
-                    if (m_focusGameOnInjectionCheckbox.IsChecked == true)
-                    {
-                        SwitchToThisWindow(process.MainWindowHandle, true);
+                }
+            }
+        }
+
+        // Processes auto-inject has already been into. Each gets one attempt: a game that closed its connection or
+        // crashed the backend is not injected again, while a relaunch is a new pid and is.
+        private HashSet<int> m_autoInjectedPids = new HashSet<int>();
+
+        // When each candidate was first seen ready, since Frontend_AutoInjectDelay counts from there.
+        private Dictionary<int, DateTime> m_autoInjectReadySince = new Dictionary<int, DateTime>();
+
+        private void Update_AutoInject() {
+            // The shared memory the frontend talks through serves one game at a time.
+            if (m_connected || m_commandLineAttachExe != null) {
+                return;
+            }
+
+            try {
+                var globalDir = GetGlobalDirPath();
+
+                if (!Directory.Exists(globalDir)) {
+                    return;
+                }
+
+                // One process snapshot per tick rather than a GetProcessesByName per profile: each of those walks
+                // every process in the system on its own.
+                var running = Process.GetProcesses().GroupBy(p => p.ProcessName, StringComparer.OrdinalIgnoreCase)
+                                                     .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
+
+                foreach (var pid in m_autoInjectReadySince.Keys.ToList()) {
+                    if (!running.Values.Any(list => list.Any(p => p.Id == pid))) {
+                        m_autoInjectReadySince.Remove(pid);
                     }
                 }
+
+                DateTime now = DateTime.Now;
+
+                foreach (var profileDir in Directory.GetDirectories(globalDir)) {
+                    var gameName = System.IO.Path.GetFileName(profileDir);
+
+                    if (!running.TryGetValue(gameName, out var candidates)) {
+                        continue;
+                    }
+
+                    // A folder alone is not a profile: selecting any process in the list creates one. Only a
+                    // config.txt that opts in counts.
+                    var configPath = System.IO.Path.Combine(profileDir, "config.txt");
+
+                    if (!File.Exists(configPath)) {
+                        continue;
+                    }
+
+                    var config = new ConfigurationBuilder().AddIniFile(configPath, optional: true, reloadOnChange: false).Build();
+
+                    if (!bool.TryParse(config["Frontend_AutoInject"], out var enabled) || !enabled) {
+                        continue;
+                    }
+
+                    double delaySeconds = 0;
+                    double.TryParse(config["Frontend_AutoInjectDelay"], System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out delaySeconds);
+
+                    foreach (var process in candidates) {
+                        if (m_autoInjectedPids.Contains(process.Id) || !IsInjectableProcess(process)) {
+                            continue;
+                        }
+
+                        if (!m_autoInjectReadySince.TryGetValue(process.Id, out var readySince)) {
+                            readySince = now;
+                            m_autoInjectReadySince[process.Id] = now;
+                        }
+
+                        var remaining = TimeSpan.FromSeconds(Math.Max(0, delaySeconds)) - (now - readySince);
+
+                        if (remaining > TimeSpan.Zero) {
+                            m_injectButton.Content = "Auto-injecting " + process.ProcessName + " in " + Math.Ceiling(remaining.TotalSeconds) + "s";
+                            return;
+                        }
+
+                        m_autoInjectReadySince.Remove(process.Id);
+
+                        m_lastSelectedProcessId = process.Id;
+                        m_lastSelectedProcessName = process.ProcessName;
+                        m_lastDefaultProcessListName = GenerateProcessName(process);
+
+                        InjectInto(process, false);
+                        FillProcessList();
+                        return;
+                    }
+                }
+            } catch (Exception ex) {
+                Console.WriteLine($"Exception caught: {ex}");
             }
         }
 
@@ -590,6 +651,7 @@ namespace UEVR {
         private void MainWindow_Update() {
             Update_InjectorConnectionStatus();
             Update_InjectStatus();
+            Update_AutoInject();
 
             if (m_virtualDesktopChecked == false) {
                 m_virtualDesktopChecked = true;
@@ -861,15 +923,22 @@ namespace UEVR {
             m_iniListView.Visibility = Visibility.Visible;
         }
 
+        // Whether the file on disk was missing a mandatory key when it was last read, so that injecting can
+        // write the defaults out. Without it a setting that only the frontend reads, like Frontend_AutoInject,
+        // would live in this window and never reach the profile.
+        private bool m_currentConfigMissedMandatory = false;
+
         private void InitializeConfig_FromPath(string configPath) {
             var builder = new ConfigurationBuilder().AddIniFile(configPath, optional: true, reloadOnChange: false);
 
             m_currentConfig = builder.Build();
             m_currentConfigPath = configPath;
+            m_currentConfigMissedMandatory = false;
 
             foreach (var entry in MandatoryConfig.Entries) {
                 if (m_currentConfig.AsEnumerable().ToList().FindAll(v => v.Key == entry.Key).Count() == 0) {
                     m_currentConfig[entry.Key] = entry.Value;
+                    m_currentConfigMissedMandatory = true;
                 }
             }
 
@@ -1045,6 +1114,15 @@ namespace UEVR {
                 return;
             }
 
+            InjectInto(process, true);
+        }
+
+        // The one injection sequence, shared by the Inject button, --attach and auto-inject.
+        // Failures are only reported when a user pressed a button and is there to read them.
+        private void InjectInto(Process process, bool reportErrors) {
+            // Whatever path injected, auto-inject must not follow up in the second before the backend connects.
+            m_autoInjectedPids.Add(process.Id);
+
             string runtimeName;
 
             if (m_openvrRadio.IsChecked == true) {
@@ -1058,19 +1136,26 @@ namespace UEVR {
             if (m_nullifyVRPluginsCheckbox.IsChecked == true) {
                 IntPtr nullifierBase;
                 if (Injector.InjectDll(process.Id, "UEVRPluginNullifier.dll", out nullifierBase) && nullifierBase.ToInt64() > 0) {
-                    if (!Injector.CallFunctionNoArgs(process.Id, "UEVRPluginNullifier.dll", nullifierBase, "nullify", true)) {
+                    if (!Injector.CallFunctionNoArgs(process.Id, "UEVRPluginNullifier.dll", nullifierBase, "nullify", true) && reportErrors) {
                         MessageBox.Show("Failed to nullify VR plugins.");
                     }
-                } else {
+                } else if (reportErrors) {
                     MessageBox.Show("Failed to inject plugin nullifier.");
                 }
             }
 
             if (Injector.InjectDll(process.Id, runtimeName)) {
+                InitializeConfig(process.ProcessName);
+
                 try {
                     if (m_currentConfig != null) {
-                        if (m_currentConfig["Frontend_RequestedRuntime"] != runtimeName) {
+                        var runtimeChanged = m_currentConfig["Frontend_RequestedRuntime"] != runtimeName;
+
+                        if (runtimeChanged) {
                             m_currentConfig["Frontend_RequestedRuntime"] = runtimeName;
+                        }
+
+                        if (runtimeChanged || m_currentConfigMissedMandatory) {
                             RefreshConfigUI();
                             SaveCurrentConfig();
                         }
